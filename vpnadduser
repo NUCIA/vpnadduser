@@ -1,0 +1,273 @@
+#!/bin/bash
+
+VERSION=2.2;
+AUTHOR="Charles Spence IV";
+MODDATE="11/18/2014";
+
+USHELL="/usr/bin/student"
+USKEL="/etc/skel.student"
+EX_DATE="-e `date --date=\"+120 day\" +%F`"
+SERVER_IP="example.com"
+
+POS=$PWD
+EASY_RSA="/etc/easy-rsa"
+KEYS="$EASY_RSA/keys"
+CLEANUP="/opt/userscripts/cleanup"
+BAR="################################################################"
+
+isAdmin=0
+isInstructor=0
+isStudent=1
+isFirewalled=0
+customEx=0
+JOBNAME=""
+
+# This is the help display funciton.
+help ()
+{
+echo -e "\nUsage: $0 [-hvAIn] [-f jobname] [-e days] userfile\n"
+
+echo -e "Options:"
+echo -e "\t-h: only displays this help screen"
+echo -e "\t-v: only displays version number"
+echo -e "\t-A: add user(s) with administrative access (includes -n)"
+echo -e "\t-I: add user(s) as instructor (includes -n)"
+echo -e "\t-n: add user(s) without expiration"
+echo -e "\t-f: add student(s) with firewall rules (requires job name)"
+echo -e "\t-e: set non-default expiration\n"
+
+echo -e "userfile - CVS file with the following format:"
+echo -e "\tusername,firstname,lastname,id\n"
+
+echo -e "This script is used to add users to the system and create the needed"
+echo -e "keys, certificates, and configuration files for OpenVPN.\n"
+
+echo -e "Exit Values:\n"
+
+echo -e "\t0: No errors"
+echo -e "\t1: No userfile given"
+echo -e "\t2: Too many arguments given"
+echo -e "\t3: Userfile does not exist"
+echo -e "\t4: Invalid flag"
+echo -e "\t5: No jobname included with -f option\n"
+exit 0;
+}
+
+function notStudentInit ()
+{
+	USHELL="/bin/bash"
+	USKEL="/etc/skel"
+	if [ $customEx == 0 ]; then
+		EX_DATE=""
+	fi
+}
+
+# Checking the command line flags
+while getopts hvAInf:e: opt
+do
+    case "$opt" in
+	h) help ;;
+	v) echo -e "Version: $VERSION\nWritten by: $AUTHOR"
+	   echo -e "Last Modified: $MODDATE"
+	   exit 0 ;;
+	A) isAdmin=1
+	   isStudent=0 ;;
+	I) isInstructor=1
+	   isStudent=0 ;;
+	n) EX_DATE="" ;;
+	f) JOBNAME="$OPTARG"
+	   isFirewalled=1 ;;
+	e) customEx=1
+	   EX_DATE="-e `date --date=\"+$OPTARG day\" +%F`" ;;
+	?) echo -e "Use $0 -h to get help."
+	   exit 4 ;;
+    esac
+done
+shift $(( OPTIND -1 ))
+
+# Checking to make sure one and only one argument was given.
+if [ $# == '0' ]; then
+    echo "Specify user file"
+    echo "For help, use: $0 -h"
+    exit 1;
+fi
+
+if [ $# -gt '1' ]; then
+    echo "Too many arguments given"
+    echo "For help, use: $0 -h"
+    exit 2;
+fi
+
+# Checking to make sure the file given exists.
+if [ ! -e $1 ]; then
+    echo "File does not exist"
+    echo "For help, use: $0 -h"
+    exit 3;
+fi
+
+if [ $isFirewalled == '1' ] && [ -z "$JOBNAME" ]; then
+	echo "The -f option requires -j JOBNAME"
+	echo "For help, use: $0 -h"
+	exit 5;
+fi
+
+if [ $isStudent == '0' ]; then notStudentInit; fi
+if [ $isAdmin == '1' ]; then USHELL="/bin/bash"; fi
+
+# SET VARIABLES
+cd $EASY_RSA
+. ./vars > /dev/null
+cd $POS
+# END SET VARIABLES
+
+#Create cleanup script for the end of the semester
+if [ $isStudent == '1' ] && [ $isFirewalled == '1' ]; then
+	# Generate a cleanup file for this batch.
+	echo "#!/bin/bash" > $CLEANUP/$JOBNAME.cleanup.sh
+	echo "#Run on `date`" >> $CLEANUP/$JOBNAME.cleanup.sh
+fi
+
+if [ $isFirewalled == '1' ]; then
+	systemctl stop fail2ban #Prevents us from saving redundant rules
+fi
+
+#cat "$1" | while IFS=, read uname fname lname pword id
+cat "$1" | while IFS=, read uname fname lname id
+do
+	# SET USER VPN PATH
+    VPN_DIR="/home/$uname/vpn"	
+
+    #echo "fisrtname=$fname, lastname=$lname, username=$uname"
+    echo -e "\n$BAR\n"
+
+	#USER ACCOUNT GENERATION
+    #Checking for user.
+    uExist="`grep ^$uname: /etc/passwd`"
+    if [ -n "$uExist" ]; then
+		echo "Account for $fname $lname exists! Checking expiration..."
+		nExp="`grep ^$uname:.*::\$ /etc/shadow`"
+		# If no expiration date found, don't change expiration.
+		if [ -z "$nExp" ]; then
+			echo -e "Changing expiration date.\n"
+			/usr/sbin/usermod $EX_DATE $uname
+		else
+			echo -e "The account will not be expired.\n"
+		fi
+    else
+		echo "Adding $fname $lname with username: $uname..."
+	    
+		# ADD USER AND SET PASSWORD
+		echo -e "/usr/sbin/useradd -m -k $USKEL $EX_DATE -s $USHELL $uname"
+		/usr/sbin/useradd -m -k $USKEL $EX_DATE -s $USHELL $uname
+		#echo $pword | /usr/bin/passwd --stdin $uname > /dev/null
+
+		if [ $isStudent == '1' ]; then
+			/usr/bin/gpasswd -a $uname student
+			mkdir -p $VPN_DIR # Fixing user home for students
+			/usr/sbin/usermod -d $VPN_DIR $uname
+		else
+			if [ $isInstructor = '1' ]; then
+				/usr/bin/gpasswd -a $uname instructor
+			fi
+			if [ $isAdmin == '1' ]; then
+				/usr/bin/gpasswd -a $uname wheel # Add to admin
+			fi
+		fi
+
+		/usr/bin/gpasswd -a $uname vpn_steal4 # Allows access to VPN
+
+		#echo "Forcing user password change on next login ..."
+		#chage -d 0 $uname
+    fi
+	
+	#USER VPN CREDENTIAL CREATION
+	cExist="$KEYS/$uname.key"
+    if [ -e "$cExist" ]; then
+		echo -n "The user $uname already has a certificate! Not creating "
+		echo -e "certificate! \n\nYOU WILL NEED TO MANUALLY RESOLVE THIS!"
+    else
+		echo -e "\nCreating OpenVPN certificate and key file\n"
+
+		# This creates the user certificates
+		$EASY_RSA/pkitool $uname
+
+		echo -e "\nMoving required OpenVPN files to /home/$uname/vpn\n"
+		mkdir -p $VPN_DIR
+		cp $KEYS/ca.crt $VPN_DIR
+		cp $KEYS/ta.key $VPN_DIR
+        cp $KEYS/$uname.crt $VPN_DIR
+        cp $KEYS/$uname.key $VPN_DIR
+
+		echo "Creating user specific OpenVPN config file ..."
+        echo -en "client\nproto tcp\ndev tun\n\n" >> $VPN_DIR/client.ovpn
+        echo -en "remote $SERVER_IP 1194\nnobind\n" >> $VPN_DIR/client.ovpn
+        echo -en "persist-key\npersist-tun\nca ca.crt\n" >> $VPN_DIR/client.ovpn
+        echo -en "cert $uname.crt\nkey $uname.key\n" >> $VPN_DIR/client.ovpn
+        echo -en "auth-user-pass\n\ncipher AES-256-CBC\n\n" >> $VPN_DIR/client.ovpn
+        echo -en "tls-auth ta.key 1\ncomp-lzo\n\nverb 3\n" >> $VPN_DIR/client.ovpn
+
+		# SET READ-ONLY PERMISSIONS FOR STUDENTS
+		if [ $isStudent == '1' ]; then
+			chown -R root:$uname /home/$uname
+			chmod 750 /home/$uname
+			chmod 750 $VPN_DIR
+			chmod 440 $VPN_DIR/*
+        else
+			chown -R $uname:$uname $VPN_DIR
+		fi
+    fi
+	
+	# GIVE STUDENTS STATIC ADDRESS
+	if [ $isStudent == '1' ] && [ $isFirewalled == '1' ]; then
+		#Do some math to get student IP (Allows up to 8191 students)
+		preOct=`echo "(1 + ( 4 * ( $id - 1 ) ) )" | bc`
+		octD=`echo "$preOct % 255" | bc`
+		gate=`echo "$octD + 1" | bc`
+		octC=`echo "128 + ( $preOct / 255 )"| bc`
+
+		echo "ifconfig-push 10.200.$octC.$octD 10.200.128.$gate" > /etc/openvpn/clients/$uname
+		echo "rm -f /etc/openvpn/clients/$uname" >> $CLEANUP/$JOBNAME.cleanup.sh
+
+		#Make student's chain
+		iptables -N STEAL4-$uname
+
+		#Add the student's chain to the STUDENTS chain
+		iptables -I STEAL4-STUDENTS -s 10.200.$octC.$octD -j STEAL4-$uname
+		iptables -I STEAL4-STUDENTS -d 10.200.$octC.$octD -j STEAL4-$uname
+
+		#Add the rules for the student's chain (Supports up to 253 students right now)
+		iptables -A STEAL4-$uname -s 10.4.32.$id -j STEAL4-DIRECTION
+		iptables -A STEAL4-$uname -d 10.4.32.$id -j STEAL4-DIRECTION
+		iptables -A STEAL4-$uname -s 10.4.64.$id -j STEAL4-DIRECTION
+		iptables -A STEAL4-$uname -d 10.4.64.$id -j STEAL4-DIRECTION
+		iptables -A STEAL4-$uname -s 10.4.96.$id -j STEAL4-DIRECTION
+		iptables -A STEAL4-$uname -d 10.4.96.$id -j STEAL4-DIRECTION
+		iptables -A STEAL4-$uname -s 10.4.128.$id -j STEAL4-DIRECTION
+		iptables -A STEAL4-$uname -d 10.4.128.$id -j STEAL4-DIRECTION
+		iptables -A STEAL4-$uname -s 10.4.160.$id -j STEAL4-DIRECTION
+		iptables -A STEAL4-$uname -d 10.4.160.$id -j STEAL4-DIRECTION
+		iptables -A STEAL4-$uname -s 10.4.192.$id -j STEAL4-DIRECTION
+		iptables -A STEAL4-$uname -d 10.4.192.$id -j STEAL4-DIRECTION
+		#iptables -A STEAL4-$uname -s 10.4.224.$id -j STEAL4-DIRECTION
+		#iptables -A STEAL4-$uname -d 10.4.224.$id -j STEAL4-DIRECTION
+
+		echo "iptables -D STEAL4-STUDENTS -s 10.200.$octC.$octD -j STEAL4-$uname" >> $CLEANUP/$JOBNAME.cleanup.sh
+		echo "iptables -D STEAL4-STUDENTS -d 10.200.$octC.$octD -j STEAL4-$uname" >> $CLEANUP/$JOBNAME.cleanup.sh
+		echo "iptables -F STEAL4-$uname" >> $CLEANUP/$JOBNAME.cleanup.sh
+		echo "iptables -X STEAL4-$uname" >> $CLEANUP/$JOBNAME.cleanup.sh
+
+		echo "systemctl stop fail2ban" >> $CLEANUP/$JOBNAME.clean.sh
+		echo "/usr/libexec/iptables/iptables.init save" >> $CLEANUP/$JOBNAME.cleanup.sh
+		echo "systemctl start fail2ban" >> $CLEANUP/$JOBNAME.clean.sh
+		chmod u+x $CLEANUP/$JOBNAME.cleanup.sh
+	fi
+	
+	if [ $isFirewalled == '1' ]; then
+		/usr/libexec/iptables/iptables.init save #Save firewall changes.
+		systemctl start fail2ban #You want to stay safe right?! Gotta turn it on!
+	fi
+
+	echo -e "\nFinished adding user $uname"
+done
+
+echo -e "\n$BAR\n"
