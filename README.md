@@ -1,6 +1,6 @@
 # VPN Add User Script
 
-A quick script for adding users to a specific gateway
+A quick script for adding users to a specific VPN gateway
 
 ## Introduction
 
